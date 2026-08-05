@@ -1,15 +1,11 @@
 [project]
 name = "epub-to-audiobook"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Convert EPUB files into chaptered M4B audiobooks using gpt-audio via OpenRouter"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "beautifulsoup4>=4.14.3",
     "ebooklib>=0.20",
-    "lxml>=6.0.2",
-    "numpy>=2.4.4",
-    "soundfile>=0.13.1",
-    "torch>=2.0",
-    "vibevoice @ git+https://github.com/microsoft/VibeVoice.git",
+    "requests>=2.32",
 ]

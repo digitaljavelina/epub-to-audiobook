@@ -15,5 +15,12 @@ wheels/
 # macOS
 .DS_Store
 
-# Voice prompt files (large binaries)
+# Generated audio: chapter WAVs and finished m4b files
+output/
+*.wav
+*.m4b
+*.chapters.txt
+wav_list.txt
+
+# Leftover VibeVoice speaker embeddings from the previous implementation
 voices/
