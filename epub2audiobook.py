@@ -10,11 +10,15 @@ import difflib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 import ebooklib
 import requests
@@ -37,6 +41,31 @@ PRICE_PER_1K_CHARS = {
 SAMPLE_RATE = 24000          # gpt-audio pcm16 is 24 kHz mono
 MAX_CHUNK_CHARS = 800        # tested safe; larger chunks start truncating
 MAX_RETRIES = 4
+
+# gpt-audio is a moderated model. On text it objects to it answers you instead of
+# reading, so these openers mean "refused", not "misheard".
+REFUSAL_MARKERS = (
+    "i'm sorry", "i am sorry", "i can't assist", "i cannot assist",
+    "i can't help", "i cannot help", "i won't be able", "i'm not able",
+    "i can't read", "i cannot read", "i'm unable", "i am unable",
+)
+
+# Half a second of silence stands in for a refused sentence when there is no fallback.
+SILENCE = b"\x00\x00" * (SAMPLE_RATE // 2)
+
+# Matched to the gpt-audio narration measured off a finished book, so the local
+# fallback does not jump out at you: -24.8 LUFS integrated, roughly 190 words/min.
+FALLBACK_RATE = 190
+FALLBACK_LUFS = -24.8
+
+
+class Refused(Exception):
+    """The model answered instead of reading it.
+
+    Moderation is probabilistic, not a fixed blocklist: the same sentence sometimes
+    reads fine on a later attempt, so this is retried like any other failure. It is a
+    distinct type only so the log can say why a passage needed the local fallback.
+    """
 
 
 # ---------- EPUB -> text ----------
@@ -138,33 +167,146 @@ def synthesize(text, voice, api_key, model):
     spoken = "".join(transcript)
     fidelity = difflib.SequenceMatcher(None, text, spoken).ratio()
     if fidelity < 0.92:
+        if is_refusal(spoken):
+            raise Refused(spoken.strip())
         raise RuntimeError(f"transcript drift (similarity {fidelity:.2f})")
     return b"".join(audio)
 
 
+def local_speech(text, voice):
+    """Speak text with the macOS `say` command, level-matched to the API narration.
+
+    The API model is moderated and will not read some passages. `say` runs on your
+    machine and reads anything, so a refused sentence becomes a different voice rather
+    than a hole in the book.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        aiff = Path(tmp) / "s.aiff"
+        subprocess.run(["say", "-v", voice, "-r", str(FALLBACK_RATE), "-o", str(aiff), text],
+                       check=True, capture_output=True)
+        done = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(aiff),
+             "-af", f"loudnorm=I={FALLBACK_LUFS}:TP=-6.7:LRA=7",
+             "-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "s16le", "-"],
+            check=True, capture_output=True,
+        )
+    return done.stdout
+
+
+def make_fallback(mode, voice):
+    """Return a function that renders text the API refused, or None for plain silence."""
+    if mode == "silence":
+        return None
+    if not shutil.which("say"):
+        print("warning: `say` not found, refusals will be silent", file=sys.stderr)
+        return None
+
+    def fallback(text):
+        try:
+            return local_speech(text, voice)
+        except Exception as exc:
+            print(f"    local fallback failed ({exc}), using silence", file=sys.stderr)
+            return SILENCE
+
+    return fallback
+
+
+def is_refusal(spoken):
+    """gpt-audio is moderated. It answers instead of reading when it objects to the text."""
+    low = spoken.lower()
+    return any(p in low for p in REFUSAL_MARKERS)
+
+
 def synthesize_with_retry(index, text, voice, api_key, model):
+    """Retry every failure, including refusals, since moderation is probabilistic.
+
+    The final failure is re-raised keeping its type, so the caller can tell a refusal
+    apart from a paraphrase when it decides what to log.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return index, synthesize(text, voice, api_key, model)
         except Exception as exc:
             if attempt == MAX_RETRIES:
+                if isinstance(exc, Refused):
+                    raise
                 raise RuntimeError(f"chunk {index} failed after {MAX_RETRIES} tries: {exc}")
             print(f"    chunk {index} retry {attempt}: {exc}", file=sys.stderr)
     return index, b""
 
 
-def render_chapter(chapters_dir, number, text, voice, api_key, workers, model):
+def synthesize_salvaging_refusals(index, text, voice, api_key, model, refusals, fallback):
+    """A chunk the model will not read cleanly is retried sentence by sentence.
+
+    Moderation shows up two ways: a flat refusal, or a quiet paraphrase that trips the
+    fidelity check. Both are deterministic, so both fall back to per-sentence synthesis
+    rather than killing a run that may be hours deep. Sentences that still fail become a
+    beat of silence and are recorded verbatim. Nothing is rewritten or silently dropped.
+    """
+    try:
+        return synthesize_with_retry(index, text, voice, api_key, model)[1]
+    except (Refused, RuntimeError) as exc:
+        reason = "refused" if isinstance(exc, Refused) else "drifted"
+
+    def cover(sentence):
+        """Whatever the API will not say, say locally rather than leave a hole."""
+        return fallback(sentence) if fallback else SILENCE
+
+    how = "read locally" if fallback else "replaced with silence"
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if len(sentences) == 1:
+        refusals.append({"chunk": index, "reason": reason, "covered": bool(fallback),
+                         "text": text})
+        print(f"    chunk {index}: {reason.upper()}, {how}", file=sys.stderr, flush=True)
+        return cover(text)
+
+    pieces, substituted = [], 0
+    for sentence in sentences:
+        try:
+            pieces.append(synthesize_with_retry(index, sentence, voice, api_key, model)[1])
+        except Exception as exc:
+            refusals.append({"chunk": index, "reason": reason, "covered": bool(fallback),
+                             "text": sentence, "error": str(exc)})
+            pieces.append(cover(sentence))
+            substituted += 1
+    kept = len(sentences) - substituted
+    print(f"    chunk {index}: {reason}, salvaged {kept}/{len(sentences)} sentences"
+          + (f", {substituted} {how}" if substituted else ""),
+          file=sys.stderr, flush=True)
+    return b"".join(pieces)
+
+
+def cached_chunk(cache_dir, number, index, text, voice, api_key, model, progress,
+                 refusals, fallback):
+    """Synthesize one chunk, or reuse it from disk if a previous run already paid for it."""
+    cached = cache_dir / f"chapter_{number:03d}_{index:04d}.pcm"
+    if cached.exists():
+        progress(cached=True)
+        return index, cached.read_bytes()
+
+    pcm = synthesize_salvaging_refusals(index, text, voice, api_key, model, refusals,
+                                        fallback)
+    tmp = cached.with_suffix(".tmp")
+    tmp.write_bytes(pcm)
+    tmp.rename(cached)                    # atomic, so a killed run never caches a partial chunk
+    progress(cached=False)
+    return index, pcm
+
+
+def render_chapter(chapters_dir, cache_dir, number, text, voice, api_key, workers,
+                   model, progress, refusals, fallback):
     out = chapters_dir / f"chapter_{number:03d}.wav"
     if out.exists():
-        print(f"  chapter {number}: already done, skipping")
+        print(f"  chapter {number}: already done, skipping", flush=True)
         return out
 
     chunks = chunk_text(text)
-    print(f"  chapter {number}: {len(text):,} chars in {len(chunks)} chunks")
+    print(f"  chapter {number}: {len(text):,} chars in {len(chunks)} chunks", flush=True)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(synthesize_with_retry, i, c, voice, api_key, model)
+            pool.submit(cached_chunk, cache_dir, number, i, c, voice, api_key, model,
+                        progress, refusals, fallback)
             for i, c in enumerate(chunks)
         ]
         pieces = [f.result() for f in futures]
@@ -231,6 +373,11 @@ def main():
     ap.add_argument("--max-chapters", type=int, help="stop after N chapters (for test runs)")
     ap.add_argument("--min-chars", type=int, default=500,
                     help="skip sections shorter than this (drops title pages, copyright, TOC)")
+    ap.add_argument("--fallback", choices=["say", "silence"], default="say",
+                    help="what to do with passages the moderated model refuses: read them "
+                         "with the local macOS voice (default) or leave silence")
+    ap.add_argument("--fallback-voice", default="Samantha",
+                    help="macOS voice for refused passages (see `say -v '?'`)")
     ap.add_argument("--estimate", action="store_true", help="print cost estimate and exit")
     args = ap.parse_args()
 
@@ -263,17 +410,59 @@ def main():
 
     out_dir = Path(args.output_folder)
     chapters_dir = out_dir / "chapters"
+    cache_dir = out_dir / "chunks"
     chapters_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    total_chunks = sum(len(chunk_text(c["text"])) for c in chapters)
+    counter = {"done": 0, "reused": 0}
+    lock = Lock()
+    started = time.time()
+
+    def progress(cached):
+        with lock:
+            counter["done"] += 1
+            counter["reused"] += 1 if cached else 0
+            done, billed = counter["done"], counter["done"] - counter["reused"]
+            if done % 10 and done != total_chunks:
+                return
+            elapsed = time.time() - started
+            per_chunk = elapsed / billed if billed else 0
+            eta = (total_chunks - done) * per_chunk / 60
+            spent = f", ~${billed * MAX_CHUNK_CHARS / 1000 * rate:,.2f} spent" if rate else ""
+            print(f"    {done}/{total_chunks} chunks "
+                  f"({counter['reused']} reused{spent}), eta ~{eta:.0f} min", flush=True)
+
+    refusals = []
+    fallback = make_fallback(args.fallback, args.fallback_voice)
+    if fallback:
+        print(f"refused passages will be read locally by '{args.fallback_voice}'", flush=True)
 
     wavs = []
     for i, chapter in enumerate(chapters, start=1):
-        wavs.append(render_chapter(chapters_dir, i, chapter["text"],
-                                   args.voice, api_key, args.workers, model))
+        wavs.append(render_chapter(chapters_dir, cache_dir, i, chapter["text"], args.voice,
+                                   api_key, args.workers, model, progress, refusals,
+                                   fallback))
 
     output = out_dir / (Path(args.epub).stem + ".m4b")
-    print("packaging m4b...")
+    print("packaging m4b...", flush=True)
     build_m4b(wavs, meta, output, args.cover)
     print(f"done: {output}")
+    print(f"took {(time.time() - started) / 60:.0f} min, "
+          f"{counter['done'] - counter['reused']} chunks billed this run")
+
+    if refusals:
+        report = out_dir / "refusals.json"
+        report.write_text(json.dumps(refusals, indent=2))
+        words = sum(len(r["text"].split()) for r in refusals)
+        covered = sum(1 for r in refusals if r.get("covered"))
+        print(f"\nNOTE: the model refused {len(refusals)} passage(s), about {words} words.")
+        if covered:
+            print(f"{covered} were read by the local '{args.fallback_voice}' voice instead, "
+                  f"so no text is missing. You will hear the voice change briefly.")
+        if covered < len(refusals):
+            print(f"{len(refusals) - covered} are silent gaps.")
+        print(f"Full list: {report}")
 
 
 if __name__ == "__main__":

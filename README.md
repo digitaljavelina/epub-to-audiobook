@@ -61,7 +61,28 @@ Output lands in `output/book.m4b`, with per-chapter WAVs kept in `output/chapter
 | `--cover` | Path to a cover image to embed |
 | `--max-chapters N` | Stop after N chapters, for cheap test runs |
 | `--min-chars N` | Skip sections shorter than N chars (default: 500). Drops title pages, copyright, TOC |
+| `--fallback` | `say` (default) reads refused passages with a local voice, `silence` leaves a gap |
+| `--fallback-voice` | macOS voice for refused passages (default: `Samantha`, see `say -v '?'`) |
 | `--estimate` | Print character count and cost, then exit |
+
+## Moderation
+
+Both `gpt-audio` models are moderated. On sex, profanity, and some violence they answer instead of reading, either with a flat "I'm sorry" or a quiet paraphrase. Converting a 147,000 word novel produced 28 such passages, about 0.3% of the text.
+
+You cannot prompt around it. Four framings were tested against 28 known-refused passages, including explicitly stating the text is a published literary novel:
+
+| Framing | Passages read cleanly |
+| --- | --- |
+| `Read aloud verbatim:` (current) | 3/28 |
+| Audiobook narrator framing | 0/28 |
+| Bare text, no instruction | 0/28 |
+| System prompt as TTS engine | 0/28 |
+
+Refusals are probabilistic rather than fixed, so the same sentence occasionally reads fine on a later attempt. That is why the script retries before giving up.
+
+When it does give up, `--fallback say` renders the sentence with the macOS `say` command, which is local and unmoderated. The output is resampled to 24 kHz mono and loudness-matched to the API narration (-24.8 LUFS, about 190 words per minute), so the handoff is a voice change rather than a jolt. Nothing is rewritten or dropped, and every substitution is recorded in `refusals.json`.
+
+The alternative is going direct to OpenAI's `/v1/audio/speech`, a dedicated TTS endpoint that is far less likely to refuse. It costs roughly 3.5x more: about $11.31 for a 147,000 word novel versus $3.24 on OpenRouter, because `gpt-4o-mini-tts` bills $12.00 per 1M audio tokens against $2.40 for `gpt-audio-mini`.
 
 ## Voices
 
